@@ -1,5 +1,6 @@
 //! Hypercore's main abstraction. Exposes an append-only, secure log structure.
 
+use crate::event::Event;
 use crate::feed_builder::FeedBuilder;
 use crate::replicate::{Message, Peer};
 pub use crate::storage::{Node, NodeTrait, Storage, Store};
@@ -12,6 +13,10 @@ use crate::crypto::{
 use crate::proof::Proof;
 use anyhow::{bail, ensure, Result};
 use flat_tree as flat;
+use futures::channel::mpsc::{
+    unbounded as channel, UnboundedReceiver as Receiver, UnboundedSender as Sender,
+};
+use futures::sink::SinkExt;
 use pretty_hash::fmt as pretty_fmt;
 use random_access_disk::RandomAccessDisk;
 use random_access_memory::RandomAccessMemory;
@@ -72,6 +77,7 @@ where
     pub(crate) bitfield: Bitfield,
     pub(crate) tree: TreeIndex,
     pub(crate) peers: Vec<Peer>,
+    pub(crate) subscribers: Vec<Sender<Event>>,
 }
 
 impl<T> Feed<T>
@@ -163,7 +169,23 @@ where
         self.tree.set(tree_index(index));
         self.length += 1;
 
+        self.emit(Event::Append).await;
+
         Ok(())
+    }
+
+    /// Subscribe to events emitted by this feed.
+    pub fn subscribe(&mut self) -> Receiver<Event> {
+        let (send, recv) = channel();
+        self.subscribers.push(send);
+        recv
+    }
+
+    /// Emit an event on the feed.
+    async fn emit(&self, event: Event) {
+        for mut sender in self.subscribers.iter() {
+            sender.send(event.clone()).await.unwrap();
+        }
     }
 
     /// Get the block of data at the tip of the feed. This will be the most
@@ -399,7 +421,7 @@ where
 
         if let Some(_data) = data {
             if self.bitfield.set(index, true).is_changed() {
-                // TODO: emit "download" event
+                self.emit(Event::Download(index)).await;
             }
             // TODO: check peers.length, call ._announce if peers exist.
         }

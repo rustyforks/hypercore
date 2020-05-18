@@ -3,7 +3,8 @@ extern crate random_access_memory as ram;
 mod common;
 
 use common::create_feed;
-use hypercore::{generate_keypair, Feed, NodeTrait, PublicKey, SecretKey, Storage};
+use futures::stream::StreamExt;
+use hypercore::{generate_keypair, Event, Feed, NodeTrait, PublicKey, SecretKey, Storage};
 use random_access_storage::RandomAccess;
 use std::env::temp_dir;
 use std::fmt::Debug;
@@ -152,14 +153,8 @@ async fn put() {
 async fn put_with_data() {
     // Create a writable feed.
     let mut a = create_feed(50).await.unwrap();
-
     // Create a second feed with the first feed's key.
-    let (public, secret) = copy_keys(&a);
-    let storage = Storage::new_memory().await.unwrap();
-    let mut b = Feed::builder(public, storage)
-        .secret_key(secret)
-        .build()
-        .unwrap();
+    let mut b = create_clone(&a).await.unwrap();
 
     // Append 4 blocks of data to the writable feed.
     a.append(b"hi").await.unwrap();
@@ -215,23 +210,6 @@ async fn create_with_stored_keys() {
         Feed::with_storage(storage).await.is_ok(),
         "Could not create a feed with a stored keypair."
     );
-}
-
-fn copy_keys(
-    feed: &Feed<impl RandomAccess<Error = Box<dyn std::error::Error + Send + Sync>> + Debug + Send>,
-) -> (PublicKey, SecretKey) {
-    match &feed.secret_key() {
-        Some(secret) => {
-            let secret = secret.to_bytes();
-            let public = &feed.public_key().to_bytes();
-
-            let public = PublicKey::from_bytes(public).unwrap();
-            let secret = SecretKey::from_bytes(&secret).unwrap();
-
-            (public, secret)
-        }
-        _ => panic!("<tests/common>: Could not access secret key"),
-    }
 }
 
 #[async_std::test]
@@ -297,4 +275,93 @@ async fn audit_bad_data() {
             panic!(e);
         }
     }
+}
+
+#[async_std::test]
+async fn events_append() {
+    let mut feed = create_feed(50).await.unwrap();
+    let event_task = collect_events(&mut feed, 3);
+    feed.append(br#"one"#).await.unwrap();
+    feed.append(br#"two"#).await.unwrap();
+    feed.append(br#"three"#).await.unwrap();
+
+    let event_list = event_task.await;
+    let mut expected = vec![];
+    for _i in 0..3 {
+        expected.push(Event::Append);
+    }
+    assert_eq!(event_list, expected, "Correct events emitted")
+}
+
+#[async_std::test]
+async fn events_download() {
+    let mut a = create_feed(50).await.unwrap();
+    // Create a second feed with the first feed's key.
+    let mut b = create_clone(&a).await.unwrap();
+
+    let event_task = collect_events(&mut b, 3);
+
+    a.append(b"one").await.unwrap();
+    a.append(b"two").await.unwrap();
+    a.append(b"three").await.unwrap();
+
+    for i in 0..3 {
+        let a_proof = a.proof(i, false).await.unwrap();
+        let a_data = a.get(i).await.unwrap();
+        b.put(i, a_data.as_deref(), a_proof).await.unwrap();
+    }
+
+    let event_list = event_task.await;
+
+    let mut expected = vec![];
+    for i in 0..3 {
+        expected.push(Event::Download(i));
+    }
+    assert_eq!(event_list, expected, "Correct events emitted")
+}
+
+async fn create_clone(
+    feed: &Feed<impl RandomAccess<Error = Box<dyn std::error::Error + Send + Sync>> + Debug + Send>,
+) -> Result<Feed<ram::RandomAccessMemory>, anyhow::Error> {
+    let (public, secret) = copy_keys(&feed);
+    let storage = Storage::new_memory().await?;
+    let clone = Feed::builder(public, storage).secret_key(secret).build()?;
+    Ok(clone)
+}
+
+fn copy_keys(
+    feed: &Feed<impl RandomAccess<Error = Box<dyn std::error::Error + Send + Sync>> + Debug + Send>,
+) -> (PublicKey, SecretKey) {
+    match &feed.secret_key() {
+        Some(secret) => {
+            let secret = secret.to_bytes();
+            let public = &feed.public_key().to_bytes();
+
+            let public = PublicKey::from_bytes(public).unwrap();
+            let secret = SecretKey::from_bytes(&secret).unwrap();
+
+            (public, secret)
+        }
+        _ => panic!("<tests/common>: Could not access secret key"),
+    }
+}
+
+fn collect_events(
+    feed: &mut Feed<
+        impl RandomAccess<Error = Box<dyn std::error::Error + Send + Sync>> + Debug + Send,
+    >,
+    n: usize,
+) -> async_std::task::JoinHandle<Vec<Event>> {
+    let mut events = feed.subscribe();
+    let event_task = async_std::task::spawn(async move {
+        let mut event_list = vec![];
+        while let Some(event) = events.next().await {
+            event_list.push(event);
+            if event_list.len() == n {
+                return event_list;
+            }
+        }
+        event_list
+    });
+    event_task
 }
